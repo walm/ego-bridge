@@ -74,5 +74,5 @@ esac
 if [ "$os" = darwin ]; then
   say "next (on your Mac): ego-bridge serve --listen local   or   ego-bridge ssh <host>"
 else
-  say "next (on the agent machine): ego-bridge install   (see https://github.com/$REPO#setup)"
+  say "next (on the agent machine): ego-bridge install   (see https://github.com/$REPO#manual-setup)"
 fi
