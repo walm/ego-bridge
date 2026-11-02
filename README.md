@@ -72,6 +72,41 @@ session and adds `-R /tmp/ego-bridge-<user>-<id>.sock:<local socket>`. The shim
 finds the newest live socket owned by your user, so several sessions,
 tmux and reconnects all work. Stale sockets are cleaned up.
 
+### Direct mode: OrbStack VMs, Docker containers, Tailscale
+
+Unix sockets can't cross OrbStack's VM boundary (bind-mounting the socket
+gives "connection refused"), and OrbStack's built-in SSH rejects socket
+forwards. For these, and for headless agents on your tailnet, run the bridge
+on TCP with a token:
+
+```bash
+# On the Mac (keep it running)
+ego-bridge serve --listen local          # 127.0.0.1:47777, for VMs/containers on this Mac
+ego-bridge serve --listen tailscale      # this Mac's tailnet IP, for other machines
+ego-bridge serve --listen local --listen tailscale   # both
+ego-bridge token                         # the token, created in ~/.ego-bridge/token (0600)
+```
+
+```bash
+# OrbStack machine: copy the binary in and save the address + token (token goes over stdin)
+orb -m my-vm sh -c 'mkdir -p ~/.local/bin && cat > ~/.local/bin/ego-bridge && chmod +x ~/.local/bin/ego-bridge' < dist/ego-bridge-linux-arm64
+ego-bridge token | orb -m my-vm sh -c '~/.local/bin/ego-bridge install --addr host.orb.internal:47777 --token-stdin'
+
+# Tailscale machine
+ego-bridge token | ssh my-box '~/.local/bin/ego-bridge install --addr my-mac:47777 --token-stdin'
+
+# Docker container: mount the binary as ego-browser, pass address + token
+docker run -v $PWD/dist/ego-bridge-linux-arm64:/usr/local/bin/ego-browser:ro \
+  -e EGO_BRIDGE_ADDR=host.docker.internal:47777 -e EGO_BRIDGE_TOKEN="$(ego-bridge token)" …
+```
+
+TCP connections must present the token (compared in constant time). A bad
+token gets exit code 77, logged on the Mac. `ego-bridge token --rotate`
+invalidates every agent machine. Restart `serve` and reinstall them afterwards.
+Any process in any container or VM can reach the Mac's localhost, and anything
+on your tailnet can reach the tailnet port. The token is what keeps them out, so
+treat it like an SSH key. On Tailscale, also restrict port 47777 with ACLs.
+
 ### Long-lived alternative (ssh config, VS Code Remote, mosh+ssh)
 
 ```bash
@@ -98,7 +133,7 @@ from the server. So:
 - The socket on the server is `0600` (sshd's default `StreamLocalBindMask`), and
   the shim only connects to sockets owned by its own uid. Other users on the
   server can't reach it.
-- Nothing listens on TCP. The bridge exists only while your SSH session (or
+- In SSH mode nothing listens on TCP; the bridge exists only while your SSH session (or
   `RemoteForward`) is up.
 - `ego-browser upgrade` and `import` are refused over the bridge
   (`serve --allow-all-commands` to allow).
@@ -107,4 +142,4 @@ from the server. So:
 
 - Script stdout reaches the server as ego-browser emits it (line-buffered).
 - Files over 256 MiB are not transferred.
-- Unix sockets only (macOS/Linux). Socket paths are limited to ~104 chars on macOS.
+- macOS/Linux only. Unix socket paths are limited to ~104 chars on macOS.

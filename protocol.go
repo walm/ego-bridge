@@ -20,6 +20,8 @@ type FileData struct {
 
 type Request struct {
 	Version int `json:"version"`
+	// Token authenticates TCP connections (see `ego-bridge token`).
+	Token string `json:"token,omitempty"`
 	// Args is the ego-browser argv (without the program name).
 	Args []string `json:"args"`
 	// Stdin is the script for `ego-browser nodejs < script.js`.

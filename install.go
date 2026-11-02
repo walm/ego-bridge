@@ -28,9 +28,8 @@ about file paths. The guide ends with a line starting
 ` + "`[ego-browser:skill] end of guide`" + `. If that line is missing, the output was
 truncated: save it to a file and read it in parts.
 
-If ` + "`ego-browser`" + ` says it is not connected, stop and ask the user to reconnect
-from their computer with ` + "`ego-bridge ssh <host>`" + `. Do not install ego lite on
-this server.
+If ` + "`ego-browser`" + ` says it is not connected, stop and ask the user to start or
+reconnect ego-bridge on their computer. Do not install ego lite on this machine.
 `
 
 // cmdInstall sets up the remote server: an ego-browser symlink to this binary
@@ -41,7 +40,30 @@ func cmdInstall(args []string) int {
 	binDir := fs.String("bin-dir", filepath.Join(home, ".local", "bin"), "directory for the ego-browser shim")
 	force := fs.Bool("force", false, "replace an existing ego-browser or skill not installed by ego-bridge")
 	noSkill := fs.Bool("no-skill", false, "do not install the agent skill")
+	addr := fs.String("addr", "", "direct TCP bridge address to save, e.g. host.orb.internal:"+defaultPort)
+	token := fs.String("token", "", "bridge token for --addr (prefer --token-stdin; this shows in ps/history)")
+	tokenStdin := fs.Bool("token-stdin", false, "read the bridge token for --addr from stdin")
 	fs.Parse(args)
+
+	if *addr != "" {
+		t := *token
+		if *tokenStdin {
+			var err error
+			if t, err = readTokenStdin(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+		}
+		if t == "" {
+			fmt.Fprintln(os.Stderr, "--addr needs a token: on the Mac run `ego-bridge token` and pass it with --token-stdin")
+			return 2
+		}
+		if err := saveRemoteConfig(remoteConfig{Addr: *addr, Token: t}); err != nil {
+			fmt.Fprintln(os.Stderr, "save bridge address:", err)
+			return 1
+		}
+		fmt.Println("saved bridge address", *addr, "to", remoteConfigPath())
+	}
 
 	exe, err := os.Executable()
 	if err == nil {
@@ -108,7 +130,11 @@ func cmdInstall(args []string) int {
 	if !onPath {
 		fmt.Printf("\nnote: %s is not on PATH; add it in your shell profile:\n  export PATH=\"%s:$PATH\"\n", *binDir, *binDir)
 	}
-	fmt.Println("\nNext: on your computer run `ego-bridge ssh <this-host>`, then `ego-bridge status` here.")
+	if *addr != "" {
+		fmt.Println("\nNext: keep `ego-bridge serve --listen ...` running on your computer, then run `ego-bridge status` here.")
+	} else {
+		fmt.Println("\nNext: on your computer run `ego-bridge ssh <this-host>`, then `ego-bridge status` here.")
+	}
 	if !ok {
 		return 1
 	}

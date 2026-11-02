@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ type Server struct {
 	EgoPath     string
 	StagingBase string
 	AllowAll    bool
+	Token       string // required on TCP listeners
 	Logf        func(format string, args ...any)
 
 	tempRe *regexp.Regexp // local temp paths printed by a run
@@ -62,7 +64,12 @@ func newServer(egoPath string, allowAll bool) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) Serve(ln net.Listener) error {
+// Serve accepts bridge connections. With requireToken (TCP listeners) every
+// request must carry s.Token; unix sockets rely on file permissions instead.
+func (s *Server) Serve(ln net.Listener, requireToken bool) error {
+	if requireToken && s.Token == "" {
+		return errors.New("refusing to serve TCP without a token")
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -71,7 +78,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		go s.handle(conn)
+		go s.handle(conn, requireToken)
 	}
 }
 
@@ -105,17 +112,26 @@ func commandOf(args []string) string {
 	return ""
 }
 
-func (s *Server) handle(conn net.Conn) {
+func (s *Server) handle(conn net.Conn, requireToken bool) {
 	defer conn.Close()
-	dec := json.NewDecoder(conn)
+	// Bound how long and how much a peer may send before it is authenticated.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	dec := json.NewDecoder(io.LimitReader(conn, 5*maxTransferFile))
 	var req Request
 	if err := dec.Decode(&req); err != nil {
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	w := &frameWriter{enc: json.NewEncoder(conn)}
-	fail := func(msg string) {
+	failCode := func(code int, msg string) {
 		w.send(Frame{Type: "error", Message: msg})
-		w.send(Frame{Type: "exit", Code: 2})
+		w.send(Frame{Type: "exit", Code: code})
+	}
+	fail := func(msg string) { failCode(2, msg) }
+	if requireToken && subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.Token)) != 1 {
+		s.Logf("rejected %s: bad token", conn.RemoteAddr())
+		failCode(77, "invalid bridge token; on the Mac run `ego-bridge token` and update EGO_BRIDGE_TOKEN or rerun `ego-bridge install --addr ... --token-stdin` here")
+		return
 	}
 	if req.Version != protocolVersion {
 		fail(fmt.Sprintf("protocol version mismatch: client %d, server %d; install the same ego-bridge version on both ends", req.Version, protocolVersion))

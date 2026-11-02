@@ -67,9 +67,6 @@ func currentUsername() string {
 // RemoteForward in ssh config (/tmp/ego-bridge-<user>.sock). Stale sockets
 // left by dropped connections are removed.
 func findSocket() (string, error) {
-	if s := os.Getenv("EGO_BRIDGE_SOCKET"); s != "" {
-		return s, nil
-	}
 	name := currentUsername()
 	cands, _ := filepath.Glob(fmt.Sprintf("/tmp/ego-bridge-%s-*.sock", name))
 	cands = append(cands, fmt.Sprintf("/tmp/ego-bridge-%s.sock", name))
@@ -169,19 +166,19 @@ func collectRefs(text string, roots []string) (files, dirs []FileData, warnings 
 func runShim(args []string) int {
 	notConnected := func(detail string) int {
 		fmt.Fprintln(os.Stderr, `ego-bridge: not connected to the user's local ego-browser (`+detail+`).
-This server reaches the browser through an SSH reverse tunnel. The user must
-connect from their own computer with:  ego-bridge ssh <this-host>
-(or keep a session open with a RemoteForward for /tmp/ego-bridge-`+currentUsername()+`.sock).
-Do not try to install ego-browser on this server; ask the user to reconnect.`)
+This machine reaches the user's browser through ego-bridge running on their
+computer, either over SSH (`+"`ego-bridge ssh <this-host>`"+`) or directly
+(`+"`ego-bridge serve --listen local|tailscale`"+`). Stop and ask the user to start
+or reconnect ego-bridge on their computer. Do not install ego-browser here.`)
 		return exitNoBridge
 	}
-	sock, err := findSocket()
+	tgt, err := findTarget()
 	if err != nil {
 		return notConnected(err.Error())
 	}
 
 	roots, captureRoot := remoteRoots()
-	req := Request{Version: protocolVersion, Args: args, Roots: roots, CaptureRoot: captureRoot}
+	req := Request{Version: protocolVersion, Token: tgt.token, Args: args, Roots: roots, CaptureRoot: captureRoot}
 	if needsStdin(args) {
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
@@ -196,9 +193,9 @@ Do not try to install ego-browser on this server; ask the user to reconnect.`)
 		fmt.Fprintln(os.Stderr, w)
 	}
 
-	conn, err := net.Dial("unix", sock)
+	conn, err := tgt.dial()
 	if err != nil {
-		return notConnected(err.Error())
+		return notConnected(tgt.desc + ": " + err.Error())
 	}
 	defer conn.Close()
 
@@ -294,8 +291,8 @@ differences:
 - A screenshot() without a path is copied back under %s and the
   printed path points there.
 - If `+"`ego-browser`"+` reports that it is not connected, stop and ask the user to
-  reconnect with `+"`ego-bridge ssh <host>`"+` from their computer. Do not install
-  ego lite on this server.
+  start or reconnect ego-bridge on their computer. Do not install ego lite on
+  this machine.
 - `+"`ego-browser upgrade`"+` and `+"`import`"+` are disabled here; ask the user to run them locally.
 
 `, strings.Join(roots, ", "), roots[0], capture)

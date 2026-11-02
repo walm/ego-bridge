@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -25,16 +26,23 @@ const usageText = `ego-bridge: drive your local ego-browser from agents on remot
 
 On your computer (where ego lite runs):
   ego-bridge ssh [ssh args...] <host>   ssh to <host> with the bridge forwarded
-  ego-bridge serve [--socket PATH]      run a standalone bridge for an ssh-config RemoteForward
+  ego-bridge serve [--socket PATH]      standalone bridge for an ssh-config RemoteForward
+  ego-bridge serve --listen local       direct TCP for OrbStack VMs / Docker containers
+  ego-bridge serve --listen tailscale   direct TCP for machines on your tailnet
+  ego-bridge token [--rotate]           print the token TCP clients must present
 
-On the remote server:
-  ego-bridge install [--force]          install the ego-browser shim and agent skill
+On the agent machine (server, VM, container):
+  ego-bridge install [--addr HOST:PORT --token-stdin] [--force]
+                                        install the ego-browser shim and agent skill;
+                                        --addr saves a direct TCP bridge address
   ego-bridge status                     check the connection to your computer
   ego-browser ...                       (the shim) same CLI as the local ego-browser
   ego-bridge exec ...                   same as the shim, without the symlink
 
-Environment (server side):
-  EGO_BRIDGE_SOCKET   use this socket instead of discovering /tmp/ego-bridge-$USER*.sock
+Environment (agent side):
+  EGO_BRIDGE_SOCKET   use this unix socket
+  EGO_BRIDGE_ADDR     use this TCP address (with EGO_BRIDGE_TOKEN)
+  EGO_BRIDGE_TOKEN    token for TCP (default: from ~/.ego-bridge/remote.json)
   EGO_BRIDGE_ROOTS    colon-separated dirs whose paths map to your computer
                       (default: $HOME, /tmp, $TMPDIR, cwd)
 `
@@ -61,6 +69,8 @@ func main() {
 		os.Exit(cmdInstall(args))
 	case "status":
 		os.Exit(cmdStatus())
+	case "token":
+		os.Exit(cmdToken(args))
 	case "version", "--version", "-v":
 		fmt.Println("ego-bridge", version)
 	case "help", "--help", "-h":
@@ -73,10 +83,18 @@ func main() {
 
 func cmdServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	sock := fs.String("socket", filepath.Join(bridgeHome(), "bridge.sock"), "unix socket to listen on")
+	defaultSock := filepath.Join(bridgeHome(), "bridge.sock")
+	sock := fs.String("socket", defaultSock, "unix socket to listen on (for ssh RemoteForward)")
+	var listens []string
+	fs.Func("listen", "also listen on TCP, token required: local, tailscale, or host:port (default port "+defaultPort+"; repeatable)", func(v string) error {
+		listens = append(listens, v)
+		return nil
+	})
 	ego := fs.String("ego", "", "path to the real ego-browser (default: from PATH)")
 	allowAll := fs.Bool("allow-all-commands", false, "also allow ego-browser upgrade/import over the bridge")
 	fs.Parse(args)
+	sockSet := false
+	fs.Visit(func(f *flag.Flag) { sockSet = sockSet || f.Name == "socket" })
 
 	egoPath, err := findEgoBrowser(*ego)
 	if err != nil {
@@ -88,24 +106,73 @@ func cmdServe(args []string) int {
 		log.Print(err)
 		return 1
 	}
-	ln, err := listenUnix(*sock)
-	if err != nil {
-		log.Print(err)
-		return 1
+
+	var lns []net.Listener
+	errc := make(chan error, 1+len(listens))
+	// With --listen only, skip the unix socket unless it was asked for.
+	if len(listens) == 0 || sockSet {
+		ln, err := listenUnix(*sock)
+		if err != nil {
+			log.Print(err)
+			return 1
+		}
+		defer os.Remove(*sock)
+		lns = append(lns, ln)
+		log.Printf("listening on unix socket %s", *sock)
+		log.Printf("for ssh, add to ~/.ssh/config on this computer:\n\n  Host <your-server>\n    RemoteForward /tmp/ego-bridge-<server-user>.sock %s\n    ExitOnForwardFailure yes\n", *sock)
+		go func() { errc <- srv.Serve(ln, false) }()
 	}
-	defer os.Remove(*sock)
+	if len(listens) > 0 {
+		if srv.Token, err = loadOrCreateToken(false); err != nil {
+			log.Print("token: ", err)
+			return 1
+		}
+		for _, l := range listens {
+			addr, err := resolveListen(l)
+			if err != nil {
+				log.Print(err)
+				return 1
+			}
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				log.Print(err)
+				return 1
+			}
+			lns = append(lns, ln)
+			log.Printf("listening on tcp %s, reachable from %s; token in %s", addr, exposure(addr), tokenPath())
+			go func() { errc <- srv.Serve(ln, true) }()
+		}
+		log.Printf("set up an agent machine with:\n\n  ego-bridge token | <run on agent machine> ego-bridge install --addr <this-mac>:%s --token-stdin\n\n  (<this-mac> is host.orb.internal in OrbStack, host.docker.internal in Docker, or this Mac's tailnet name)\n", defaultPort)
+	}
+	log.Printf("serving %s", egoPath)
+
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
-		ln.Close()
+		for _, ln := range lns {
+			ln.Close()
+		}
 	}()
-	log.Printf("serving %s on %s", egoPath, *sock)
-	log.Printf("add to ~/.ssh/config on this computer:\n\n  Host <your-server>\n    RemoteForward /tmp/ego-bridge-<server-user>.sock %s\n    ExitOnForwardFailure yes\n", *sock)
-	if err := srv.Serve(ln); err != nil {
+	for range lns {
+		if err := <-errc; err != nil {
+			log.Print(err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func cmdToken(args []string) int {
+	fs := flag.NewFlagSet("token", flag.ExitOnError)
+	rotate := fs.Bool("rotate", false, "generate a new token (restart `ego-bridge serve` and reinstall agents)")
+	fs.Parse(args)
+	t, err := loadOrCreateToken(*rotate)
+	if err != nil {
 		log.Print(err)
 		return 1
 	}
+	fmt.Println(t)
 	return 0
 }
 
@@ -135,7 +202,7 @@ func cmdSSH(args []string) int {
 		return 1
 	}
 	defer os.Remove(localSock)
-	go srv.Serve(ln)
+	go srv.Serve(ln, false)
 
 	remoteUser, err := sshRemoteUser(args)
 	if err != nil {
@@ -190,13 +257,13 @@ func randomID() string {
 }
 
 func cmdStatus() int {
-	sock, err := findSocket()
+	tgt, err := findTarget()
 	if err != nil {
-		fmt.Println("not connected: no live bridge socket for", currentUsername())
-		fmt.Println("connect from your computer with: ego-bridge ssh <this-host>")
+		fmt.Println("not connected:", err)
+		fmt.Println("from your computer run `ego-bridge ssh <this-host>`, or `ego-bridge serve --listen ...` and `ego-bridge install --addr ... --token-stdin` here")
 		return exitNoBridge
 	}
-	fmt.Println("socket:", sock)
+	fmt.Println("bridge:", tgt.desc)
 	roots, capture := remoteRoots()
 	fmt.Println("mapped dirs:", strings.Join(roots, ", "))
 	if capture >= 0 {
